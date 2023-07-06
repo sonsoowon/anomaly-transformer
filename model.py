@@ -6,13 +6,14 @@ import torch.nn.functional as F
 
 import numpy as np
 
-
 class SingleAnomalyAttention(nn.Module):
-    def __init__(self, N, dim):
+    def __init__(self, N, dim, use_cuda=True):
         super().__init__()
 
-        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-        torch.set_default_device(device)
+        self.device = torch.device('cpu')
+        if torch.cuda.is_available() and use_cuda:
+            self.device = torch.device('cuda')
+        torch.set_default_device(self.device)
 
         self.dim = dim
         self.N = N
@@ -22,13 +23,13 @@ class SingleAnomalyAttention(nn.Module):
         self.Wv = nn.Linear(dim, dim, bias=False)
         self.Ws = nn.Linear(dim, 1, bias=False)
 
-        self.Q = self.K = self.V = self.sigma = torch.zeros((N, dim))
+        self.Q = self.K = self.V = torch.zeros((N, dim))
+        self.sigma = torch.zeros((N, 1))
 
         self.P = torch.zeros((N, N))
         self.S = torch.zeros((N, N))
 
     def forward(self, x):
-
         self._initialize(x)
         self.P = self.prior_association()
         self.S = self.series_association()
@@ -48,37 +49,38 @@ class SingleAnomalyAttention(nn.Module):
         return normalize * torch.exp(-0.5 * (mean / sigma).pow(2))
 
     def prior_association(self):
-        distance = torch.from_numpy(
-            np.abs(np.indices((self.N, self.N))[0] - np.indices((self.N, self.N))[1])
-        )
-        gaussian = self.gaussian_kernel(distance.float(), self.sigma)
-        gaussian /= gaussian.sum(dim=-1).view(-1, 1)
+        distance = torch.from_numpy(np.abs(np.indices((self.N, self.N))[0] - np.indices((self.N, self.N))[1]))
+        gaussian = self.gaussian_kernel(distance.float().to(self.device), self.sigma)
+        div = gaussian.sum(dim=-1).unsqueeze(-1)
+        gaussian /= div
 
         return gaussian
 
     def series_association(self):
-        return F.softmax((self.Q @ self.K.T) / math.sqrt(self.dim), dim=0)
+        return F.softmax((self.Q @ self.K.transpose(1, 2)) / math.sqrt(self.dim), dim=0)
 
     def reconstruction(self):
         return self.S @ self.V
 
 
 class MultiHeadAnomalyAttention(nn.Module):
-    def __init__(self, N, d_model, head_num):
+    def __init__(self, N, d_model, head_num, use_cuda=True):
         super().__init__()
 
-        device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-        torch.set_default_device(device)
+        self.device = torch.device('cpu')
+        if torch.cuda.is_available() and use_cuda:
+            self.device = torch.device('cuda')
+        torch.set_default_device(self.device)
 
         self.h = head_num
         self.single_dim = int(d_model / head_num)
         self.N = N
 
-        self.P = torch.zeros((N, N))
-        self.S = torch.zeros((N, N))
+        self.P = torch.zeros((1, N, N))
+        self.S = torch.zeros((1, N, N))
 
         self.attn_segments = nn.ModuleList(
-            [SingleAnomalyAttention(self.N, self.single_dim) for _ in range(head_num)]
+            [SingleAnomalyAttention(self.N, self.single_dim, use_cuda) for _ in range(head_num)]
         )
 
     def forward(self, x):
@@ -87,90 +89,56 @@ class MultiHeadAnomalyAttention(nn.Module):
 
         for x, single_attn in zip(x_segments, self.attn_segments):
             reconstructions.append(single_attn(x))
-            self.P += single_attn.P / self.h
-            self.S += single_attn.S / self.h
 
-        return torch.cat(torch.tensor(reconstructions), dim=-1)
+            self.P = single_attn.P / self.h + self.P
+            self.S = single_attn.S / self.h + self.S
+
+        return torch.cat(reconstructions, dim=-1)
 
 
 class AnomalyTransformerBlock(nn.Module):
-    def __init__(self, N, d_model, head_num):
+    def __init__(self, N, d_model, head_num, d_ff=None, dropout=0.1, activation="relu", use_cuda=True):
+        super().__init__()
+        self.N, self.d_model = N, d_model
+        d_ff = d_ff or 4 * d_model
+
+        self.attention = MultiHeadAnomalyAttention(self.N, self.d_model, head_num, use_cuda)
+        self.ff1 = nn.Linear(d_model, d_ff)
+        self.ff2 = nn.Linear(d_ff, d_model)
+        self.norm1 = nn.LayerNorm(self.d_model)
+        self.norm2 = nn.LayerNorm(self.d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.activation = F.relu if activation == "relu" else F.gelu
+
+    def forward(self, x):
+        new_x = self.attention(x)
+        x = x + self.dropout(new_x)
+        x_before_ff = x = self.norm1(x)
+
+        x = self.ff1(x)
+        x = self.activation(x)
+        x = self.dropout(x)
+        x = self.ff2(x)
+        x_after_ff = self.dropout(x)
+
+        return self.norm2(x_before_ff + x_after_ff)
+
+
+class AnomalyTransformer(nn.Module):
+    def __init__(self, N, d_model, head_num, layers, d_ff=None, dropout=0.0, activation='gelu', use_cuda=True):
         super().__init__()
         self.N, self.d_model = N, d_model
 
-        self.attention = MultiHeadAnomalyAttention(self.N, self.d_model, head_num)
-        self.ln1 = nn.LayerNorm(self.d_model)
-        self.ff = nn.Sequential(nn.Linear(self.d_model, self.d_model), nn.ReLU())
-        self.ln2 = nn.LayerNorm(self.d_model)
-
-    def forward(self, x):
-        x_identity = x
-        x = self.attention(x)
-        z = self.ln1(x + x_identity)
-
-        z_identity = z
-        z = self.ff(z)
-        z = self.ln2(z + z_identity)
-
-        return z
-
-class AnomalyTransformer(nn.Module):
-    def __init__(self, N, d_model, head_num, layers, lambda_):
-        super().__init__()
-        self.N = N
-        self.d_model = d_model
-
         self.blocks = nn.ModuleList(
-            [AnomalyTransformerBlock(self.N, self.d_model, head_num) for _ in range(layers)]
+            [AnomalyTransformerBlock(self.N, self.d_model, head_num, d_ff, dropout, activation, use_cuda) for _ in range(layers)]
         )
-        self.output = None
-        self.lambda_ = lambda_
-
-        self.P_layers = []
-        self.S_layers = []
 
     def forward(self, x):
+        prior_list, series_list = [], []
         for idx, block in enumerate(self.blocks):
             x = block(x)
-            self.P_layers.append(block.attention.P)
-            self.S_layers.append(block.attention.S)
+            prior_list.append(block.attention.P)
+            series_list.append(block.attention.S)
 
-        self.output = x
-        return x
-
-    def layer_association_discrepancy(self, Pl, Sl):
-        rowwise_kl = lambda row: F.kl_div(Pl[row, :], Sl[row, :]) + F.kl_div(Sl[row, :], Pl[row, :])
-        return torch.tensor([rowwise_kl(row) for row in range(Pl.shape[0])])
-
-    def association_discrepancy(self, P_list, S_list):
-        all_ass_dis = torch.tensor([self.layer_association_discrepancy(Pl, Sl)
-                                    for Pl, Sl, in zip(P_list, S_list)])
-        return torch.mean(all_ass_dis, dim=0).unsqueeze(1)
-
-    def loss_function(self, x, x_reconstructed, P_list, S_list, lambda_):
-        frob_norm = torch.linalg.matrix_norm(x_reconstructed - x, ord="fro")
-        ass_dis = torch.linalg.norm(self.association_discrepancy(P_list, S_list), ord=1)
-        return frob_norm - lambda_ * ass_dis
-
-    def min_loss(self, x):
-        P_list = self.P_layers
-        S_list = [S.detach() for S in self.S_layers]
-        lambda_ = -self.lambda_
-        return self.loss_function(self.output, P_list, S_list, lambda_, x)
-
-    def max_loss(self, x):
-        P_list = [P.detach() for P in self.P_layers]
-        S_list = self.S_layers
-        lambda_ = self.lambda_
-        return self.loss_function(self.output, P_list, S_list, lambda_, x)
-
-    def anomaly_score(self, x):
-        ass_dis_ratio = F.softmax(-self.association_discrepancy(self.P_layers, self.S_layers), dim=0)
-        assert ass_dis_ratio.shape[0] == self.N
-
-        reconstruction_error = torch.tensor([torch.linalg.norm(x[i, :] - self.output[i, :], ord=2) for i in range(self.N)])
-        assert reconstruction_error.shape[0] == self.N
-
-        score = torch.mul(ass_dis_ratio, reconstruction_error)
-        return score
+        return x, prior_list, series_list
 
