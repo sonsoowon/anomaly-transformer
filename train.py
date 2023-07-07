@@ -12,6 +12,8 @@ from torch.linalg import norm
 from config import train_config
 from association_based import AssociationBased
 
+from sklearn.metrics import precision_recall_fscore_support
+from sklearn.metrics import accuracy_score
 
 class Solver:
     def __init__(self, config):
@@ -66,17 +68,18 @@ class Solver:
         for n_epoch in range(self.epoch):
             min_losses, max_losses = [], []
             for step, (batch_data, _) in enumerate(self.train_loader):
-                output, prior_list, series_list = self.model(batch_data)
+                with torch.autograd.set_detect_anomaly(True):
+                    output, prior_list, series_list = self.model(batch_data)
 
-                association_based = AssociationBased(output, prior_list, series_list, self.lambda_)
-                min_loss, max_loss = association_based.minimax_loss(batch_data)
-                min_losses.append(min_loss.item())
-                max_losses.append(max_loss.item())
+                    association_based = AssociationBased(output, prior_list, series_list, self.lambda_)
+                    min_loss, max_loss = association_based.minimax_loss(batch_data)
+                    min_losses.append(min_loss.item())
+                    max_losses.append(max_loss.item())
 
-                self.optimizer.zero_grad()
-                min_loss.backward(retain_graph=True)
-                max_loss.backward()
-                self.optimizer.step()
+                    self.optimizer.zero_grad()
+                    min_loss.backward(retain_graph=True)
+                    max_loss.backward()
+                    self.optimizer.step()
                 # print(f"{step}th batch | min_loss: {min_loss.item():.2f} max_loss: {max_loss.item():.2f}")
 
                 # gc.collect()
@@ -126,11 +129,42 @@ class Solver:
 
         test_scores = torch.cat(anomaly_scores, dim=0).reshape(-1)
         thresh = self.get_threshold()
+        anomaly_preds = (test_scores > thresh).int().numpy()
+        test_labels = np.concatenate(test_labels, dim=0).reshape(-1)
 
-        # TODO: 예측값 비교부터
-        test_labels = torch.cat(test_labels, dim=0).reshape(-1)
-        anomaly_pred = (test_scores > thresh).astype(int)
+        self.adjust_prediction(anomaly_preds, test_labels)
 
+        accuracy = accuracy_score(test_labels, anomaly_preds)
+        precision, recall, f_score, support = precision_recall_fscore_support(test_labels, anomaly_preds,
+                                                                              average='binary')
+        print(
+            "Accuracy : {:0.4f}, Precision : {:0.4f}, Recall : {:0.4f}, F-score : {:0.4f} ".format(
+                accuracy, precision,
+                recall, f_score))
+
+        return accuracy, precision, recall, f_score
+
+    def adjust_prediction(self, pred, gt):
+        anomaly_state = False
+        for i in range(len(gt)):
+            if gt[i] == 1 and pred[i] == 1 and not anomaly_state:
+                anomaly_state = True
+                for j in range(i, 0, -1):
+                    if gt[j] == 0:
+                        break
+                    else:
+                        if pred[j] == 0:
+                            pred[j] = 1
+                for j in range(i, len(gt)):
+                    if gt[j] == 0:
+                        break
+                    else:
+                        if pred[j] == 0:
+                            pred[j] = 1
+            elif gt[i] == 0:
+                anomaly_state = False
+            if anomaly_state:
+                pred[i] = 1
 
     def get_threshold(self):
         anomaly_scores = []
@@ -177,6 +211,8 @@ class EarlyStopping:
 
 
 if __name__ == "__main__":
+    torch.autograd.set_detect_anomaly(True)
     solver = Solver(train_config)
     solver.train()
+    solver.test()
 

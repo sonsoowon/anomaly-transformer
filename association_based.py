@@ -2,7 +2,6 @@ import torch.nn.functional as F
 import torch
 
 from torch.linalg import norm
-
 class AssociationBased:
     def __init__(self, output, prior_list, series_list, lamba_):
         self.output = output
@@ -11,10 +10,12 @@ class AssociationBased:
         self.lambda_ = lamba_
 
     def association_discrepancy(self, prior_list, series_list):  # (L, B, N, N) -> (B, N)
-        layer_ass_disc = lambda pl, sl: self._rowwise_kl_div(pl, sl) + self._rowwise_kl_div(sl, pl)
-        all_ass_disc = torch.stack([layer_ass_disc(prior_layer, series_layer)
+        all_ass_disc = torch.stack([self._layer_ass_disc(prior_layer, series_layer)
                                     for prior_layer, series_layer, in zip(prior_list, series_list)], dim=0)
         return torch.mean(all_ass_disc, dim=0)
+
+    def _layer_ass_disc(self, pl, sl):
+        return self._rowwise_kl_div(pl, sl) + self._rowwise_kl_div(sl, pl)
 
     def minimax_loss(self, x):
         return self.min_loss(x), self.max_loss(x)
@@ -50,5 +51,5 @@ class AssociationBased:
 
     @staticmethod
     def _rowwise_kl_div(pred, true):  # (B, N, N) -> (B, N)
-        loss_pointwise = pred * (pred.log() - true)
-        return torch.sum(loss_pointwise, dim=-1) / pred.shape[-1]
+        loss_pointwise = pred * (torch.log(pred + 1e-4) - torch.log(true + 1e-4))
+        return torch.mean(torch.sum(loss_pointwise, dim=-1), dim=-1)

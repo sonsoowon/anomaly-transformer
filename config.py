@@ -30,5 +30,7 @@ train_config = OmegaConf.create({
 
     'batch_size': 32,
     'lr': 0.0001,
-    'epoch': 10
+    'epoch': 10,
+
+    'anomaly_ratio': 0.001
 })

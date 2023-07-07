@@ -51,8 +51,8 @@ class SingleAnomalyAttention(nn.Module):
     def prior_association(self):
         distance = torch.from_numpy(np.abs(np.indices((self.N, self.N))[0] - np.indices((self.N, self.N))[1]))
         gaussian = self.gaussian_kernel(distance.float().to(self.device), self.sigma)
-        div = gaussian.sum(dim=-1).unsqueeze(-1)
-        gaussian /= div
+        div = torch.sum(gaussian, dim=-1).unsqueeze(-1)
+        gaussian = gaussian / div
 
         return gaussian
 
@@ -112,10 +112,9 @@ class AnomalyTransformerBlock(nn.Module):
 
     def forward(self, x):
         new_x = self.attention(x)
-        x = x + self.dropout(new_x)
-        x_before_ff = x = self.norm1(x)
+        x_before_ff = self.norm1(x + self.dropout(new_x))
 
-        x = self.ff1(x)
+        x = self.ff1(x_before_ff)
         x = self.activation(x)
         x = self.dropout(x)
         x = self.ff2(x)
